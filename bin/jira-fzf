@@ -14,7 +14,7 @@
 #   jira-fzf --persist                    Keep open after actions (for scratchpads)
 #   jira-fzf --one-shot                   Exit after selection (default)
 #   jira-fzf --dry-run                    Test ticket creation without creating
-#   jira-fzf --labels "front-end,bug"    Set default labels for new tickets
+#   jira-fzf --labels "improvement,bug"    Set default labels for new tickets
 #   
 # Keybindings:
 #   <CR> maximize preview  <C-y> copy  <C-o> open  <C-t> new  <C-s> sort  <C-r> refresh
@@ -180,7 +180,7 @@ TICKETS_CACHE="$CACHE_DIR/tickets.json"
 SORT_ORDER_FILE="$CACHE_DIR/sort_order"
 CACHE_TTL=300  # 5 minutes
 DRY_RUN=false
-DEFAULT_LABELS="front-end"  # Default labels to add to new tickets
+DEFAULT_LABELS="improvement"  # Default labels to add to new tickets
 DEFAULT_SORT="updated DESC"  # Default sort order
 PERSIST_MODE=""  # Empty = use FZF_PERSIST_MODE env var, "--persist" = force on, "--one-shot" = force off
 

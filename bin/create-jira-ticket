@@ -38,7 +38,7 @@ if [ -z "$JIRA_DOMAIN" ] || [ -z "$JIRA_PROJECT" ]; then
     exit 1
 fi
 DRY_RUN=false
-DEFAULT_LABELS="front-end"
+DEFAULT_LABELS="improvement"
 OUTPUT_FILE=""
 CLEAR_SCREEN=false
 
@@ -159,6 +159,92 @@ get_labels() {
     echo "$labels"
 }
 
+# Function to get the Client custom field ID
+get_client_field_id() {
+    local response=$(jira_api "field")
+    echo "$response" | jq -r '.[] | select(.name == "Client") | .id' 2>/dev/null
+}
+
+# Function to get available clients
+get_clients() {
+    # First, get the Client field ID
+    local field_id=$(get_client_field_id)
+    
+    if [ -z "$field_id" ] || [ "$field_id" = "null" ]; then
+        echo "Error: Could not find Client field" >&2
+        return 1
+    fi
+
+    # Determine issue type context (accept optional arg, fallback to global $issue_type)
+    local creating_issue_type="${1:-${issue_type:-}}"
+
+    # For Tasks, Client is mandatory (per your workflow), so build the pool from existing Tasks.
+    # For other issue types, build the pool from any existing issues that have Client set.
+    local jql=""
+    if [ "$creating_issue_type" = "Task" ]; then
+        jql="project=${JIRA_PROJECT} AND issuetype=Task AND \"Client\" is not EMPTY ORDER BY created DESC"
+    else
+        jql="project=${JIRA_PROJECT} AND \"Client\" is not EMPTY ORDER BY created DESC"
+    fi
+
+    # Fetch clients from existing issues (paged). This is more reliable than createmeta for custom fields.
+    local start_at=0
+    local max_results=100
+    local clients=""
+
+    while true; do
+        local jql_encoded
+        jql_encoded=$(echo "$jql" | jq -sRr @uri)
+
+        local response
+        response=$(curl -s --max-time 10 -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" \
+            "https://${JIRA_DOMAIN}/rest/api/3/search/jql?jql=${jql_encoded}&startAt=${start_at}&maxResults=${max_results}&fields=${field_id}" 2>&1)
+
+        # If Jira returns an error JSON, stop paging and fall through to "None..."
+        if ! echo "$response" | jq -e '.issues' >/dev/null 2>&1; then
+            break
+        fi
+
+        local page_clients
+        page_clients=$(echo "$response" | jq -r --arg fid "$field_id" '
+            .issues[]?.fields[$fid]?
+            | if type == "object" then
+                (.value // .name // empty)
+              elif type == "string" then
+                .
+              elif type == "array" then
+                (.[]
+                  | if type == "object" then (.value // .name // empty)
+                    elif type == "string" then .
+                    else empty end)
+              else
+                empty
+              end
+        ' 2>/dev/null)
+
+        if [ -n "$page_clients" ]; then
+            clients=$(printf '%s\n%s\n' "$clients" "$page_clients")
+        fi
+
+        local total
+        total=$(echo "$response" | jq -r '.total // 0' 2>/dev/null || echo 0)
+
+        start_at=$((start_at + max_results))
+        if [ "$start_at" -ge "$total" ]; then
+            break
+        fi
+    done
+
+    clients=$(echo "$clients" | sed '/^[[:space:]]*$/d' | sort -u)
+
+    if [ -z "$clients" ]; then
+        # Keep sentinel consistent with downstream checks/payload building.
+        echo "None (no clients found)"
+    else
+        echo "$clients"
+    fi
+}
+
 # Function to get active sprints (returns most recent active sprint first, then "No sprint")
 get_sprints() {
     # Get the board ID first (use Agile API)
@@ -213,7 +299,7 @@ echo "" >&2
 
 # Step 1: Summary
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/8:\033[0m Enter ticket summary                         \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 1/9:\033[0m Enter ticket summary                         \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 echo -n "  ✏️  " >&2
 # Cross-shell compatible read with pre-filled value
@@ -244,7 +330,7 @@ echo "" >&2
 
 # Step 2: Issue Type
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 2/8:\033[0m Select issue type                             \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 2/9:\033[0m Select issue type                             \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 issue_type=$(get_issue_types | $FZF --prompt="  🏷️  Issue Type > " --height=12 --reverse --border=rounded)
 if [ -z "$issue_type" ]; then
@@ -258,7 +344,7 @@ echo "" >&2
 
 # Step 3: Priority (default to Medium - first in list)
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 3/8:\033[0m Select priority \033[2m(default: Medium)\033[0m            \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 3/9:\033[0m Select priority \033[2m(default: Medium)\033[0m            \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 priority=$(get_priorities | $FZF --prompt="  ⚡ Priority > " --height=10 --reverse --border=rounded --header="Press Enter for default (Medium)")
 if [ -z "$priority" ]; then
@@ -269,7 +355,7 @@ echo "" >&2
 
 # Step 4: Parent Issue (optional, default: None)
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 4/8:\033[0m Select parent issue \033[2m(default: None)\033[0m          \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 4/9:\033[0m Select parent issue \033[2m(default: None)\033[0m          \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 parent_line=$(get_parent_issues | $FZF --prompt="  🔗 Parent Issue > " --height=15 --reverse --border=rounded --header="Press Enter for no parent")
 parent_key=""
@@ -281,9 +367,9 @@ else
 fi
 echo "" >&2
 
-# Step 5: Labels (default to front-end)
+# Step 5: Labels (default to improvement)
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/8:\033[0m Select labels \033[2m(TAB=multi, default: $DEFAULT_LABELS)\033[0m \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 5/9:\033[0m Select labels \033[2m(TAB=multi, default: $DEFAULT_LABELS)\033[0m \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 labels_input=$(get_labels | $FZF --prompt="  🏷️  Labels > " --height=15 --reverse --border=rounded --multi --bind 'tab:toggle+down' --header="TAB to select multiple, Enter to use default ($DEFAULT_LABELS)")
 labels=""
@@ -297,9 +383,23 @@ else
 fi
 echo "" >&2
 
-# Step 6: Sprint (defaults to most recent active sprint)
+# Step 6: Client
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 6/8:\033[0m Select sprint \033[2m(default: current active)\033[0m     \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 6/9:\033[0m Select client                                  \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
+client=$(get_clients | $FZF --prompt="  👥 Client > " --height=15 --reverse --border=rounded --header="Select a client for this ticket")
+if [ -z "$client" ]; then
+    echo "" >&2
+    printf "\033[38;5;167m  ✗ Cancelled\033[0m\n" >&2
+    rm -rf "$tmpdir"
+    exit 1
+fi
+printf "  \033[38;5;114m✓\033[0m Client: \033[0m%s\033[0m\n" "$client" >&2
+echo "" >&2
+
+# Step 7: Sprint (defaults to most recent active sprint)
+printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 7/9:\033[0m Select sprint \033[2m(default: current active)\033[0m     \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 sprint_line=$(get_sprints | $FZF --prompt="  🏃 Sprint > " --height=12 --reverse --border=rounded --header="Press Enter for default")
 sprint_id=""
@@ -317,9 +417,9 @@ else
 fi
 echo "" >&2
 
-# Step 7: Description
+# Step 8: Description
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 7/8:\033[0m Enter description \033[2m(save & quit to continue)\033[0m \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 8/9:\033[0m Enter description \033[2m(save & quit to continue)\033[0m \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 
 # Pre-populate with user description if provided
@@ -386,9 +486,9 @@ else
 fi
 echo "" >&2
 
-# Step 8: Assignee (defaults to current user)
+# Step 9: Assignee (defaults to current user)
 printf "\033[38;5;109m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m\n" >&2
-printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 8/8:\033[0m Select assignee \033[2m(default: yourself)\033[0m         \033[38;5;109m┃\033[0m\n" >&2
+printf "\033[38;5;109m┃\033[0m \033[38;5;81mStep 9/9:\033[0m Select assignee \033[2m(default: yourself)\033[0m         \033[38;5;109m┃\033[0m\n" >&2
 printf "\033[38;5;109m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m\n" >&2
 # Try to get current user as default option (first in list)
 if [ -n "$JIRA_EMAIL" ]; then
@@ -467,6 +567,17 @@ if [ -n "$labels" ]; then
     labels_field=", \"labels\": $labels_json"
 fi
 
+# Build client field
+client_field=""
+if [ -n "$client" ] && [ "$client" != "None (no clients found)" ]; then
+    client_field_id=$(get_client_field_id)
+    if [ -n "$client_field_id" ] && [ "$client_field_id" != "null" ]; then
+        # Client field format: for select/dropdown fields, use {"value": "client_name"}
+        client_json=$(echo "$client" | jq -R '{value: .}')
+        client_field=", \"$client_field_id\": $client_json"
+    fi
+fi
+
 # Create the ticket
 payload=$(cat <<EOFPAYLOAD
 {
@@ -485,6 +596,7 @@ payload=$(cat <<EOFPAYLOAD
     $assignee_field
     $parent_field
     $labels_field
+    $client_field
   }
 }
 EOFPAYLOAD
@@ -511,6 +623,9 @@ if [ "$DRY_RUN" = true ]; then
     fi
     if [ -n "$labels" ]; then
         printf "  \033[2mLabels:\033[0m      \033[0m%s\033[0m\n" "$labels" >&2
+    fi
+    if [ -n "$client" ] && [ "$client" != "None (no clients found)" ]; then
+        printf "  \033[2mClient:\033[0m      \033[0m%s\033[0m\n" "$client" >&2
     fi
     if [ -n "$sprint_id" ]; then
         printf "  \033[2mSprint:\033[0m      \033[0m%s\033[0m \033[2m(will be added via Agile API)\033[0m\n" "$sprint_id" >&2
